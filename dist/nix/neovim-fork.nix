@@ -21,6 +21,10 @@ stdenv.mkDerivation rec {
     autoPatchelfHook
   ];
 
+  buildInputs = [
+    stdenv.cc.cc.lib
+  ];
+
   # Tarball top level is bin/ lib/ share/ (contents of stage/usr, no usr/ wrapper).
   installPhase = ''
     runHook preInstall
