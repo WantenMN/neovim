@@ -1,0 +1,200 @@
+# Fork rolling tarball (traditional Linux packaging, no Nix).
+#
+# Push to release_fork -> build Release nvim on ubuntu-24.04, pack the
+# `DESTDIR` payload (contents of stage/usr: bin/ lib/ share/) as a VERSIONED
+# tarball, publish it to its own VERSIONED release (`fork-<version>`, one
+# release per version), fill version/url/hash into dist/nix/neovim-fork.nix,
+# upload that as a versioned asset plus the fixed-name pointer on the rolling
+# tag `fork-linux-x86_64`, then verify with a real `nix build` plus a smoke
+# run of the built $out/bin/nvim.
+#
+# Old versions are RETAINED as separate releases (newest 10, older pruned):
+# stale machines whose dotfiles pin an older version can still reinstall it.
+# dotfiles consumes the fixed-name pointer via pkgs/update-fork-tarballs.sh
+# (no source fetch, no hash recomputation).
+# Replaces .github/workflows/cachix-fork.yml (deleted).
+name: Fork Tarball
+
+on:
+  push:
+    branches:
+      - release_fork
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-tarball-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ROLL_TAG: fork-linux-x86_64
+  # Fixed-name pointer consumed by dotfiles (overwritten every run).
+  NIX_ASSET: neovim-fork.nix
+  # Versioned names (accumulate on the release, pruned to newest 10) are
+  # composed in the version step below.
+  NIXPKGS_TARBALL: https://channels.nixos.org/nixos-unstable/nixexprs.tar.zst
+  KEEP_VERSIONS: "10"
+
+jobs:
+  tarball:
+    name: Build, publish and verify tarball
+    if: github.repository == 'WantenMN/neovim'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v6
+        with:
+          show-progress: false
+
+      - name: Free Disk Space (Ubuntu)
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          dotnet: false
+          large-packages: false
+
+      - name: Install build dependencies
+        shell: bash --noprofile --norc -eo pipefail {0}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake curl gettext ninja-build luajit pkg-config unzip
+
+      - name: Compute rolling version
+        shell: bash --noprofile --norc -eo pipefail {0}
+        run: |
+          short_sha=$(git rev-parse --short HEAD)
+          ver_date=$(date -u +%Y.%m.%d)
+          # Keep upstream version prefix so the build is identifiable.
+          upstream=$(grep -oP 'NVIM_VERSION_(MAJOR|MINOR|PATCH|PRERELEASE)\s+\S+' CMakeLists.txt | head -n 4 || true)
+          echo "upstream: $upstream"
+          roll_version="0.13.0-dev-${ver_date}-g${short_sha}"
+          echo "roll_version=${roll_version}" >> "$GITHUB_ENV"
+          echo "short_sha=${short_sha}" >> "$GITHUB_ENV"
+          echo "ver_date=${ver_date}" >> "$GITHUB_ENV"
+          # Versioned asset names accumulate on the rolling release (old
+          # versions are retained, pruned to newest $KEEP_VERSIONS at the end).
+          echo "TARBALL=neovim-${roll_version}-linux-x86_64.tar.gz" >> "$GITHUB_ENV"
+          echo "NIX_VERSIONED=neovim-fork-${roll_version}.nix" >> "$GITHUB_ENV"
+
+      - name: Build (bundled deps via Makefile)
+        # NOTE: do NOT call cmake directly: third-party libs (luv, libuv,
+        # tree-sitter, ...) are built by the Makefile's deps stage first.
+        shell: bash --noprofile --norc -eo pipefail {0}
+        run: |
+          make -j"$(nproc)" CMAKE_BUILD_TYPE=Release CMAKE_INSTALL_PREFIX=/usr
+
+      - name: Install to stage and pack tarball
+        shell: bash --noprofile --norc -eo pipefail {0}
+        run: |
+          rm -rf stage
+          mkdir -p stage
+          DESTDIR="$PWD/stage" make install
+          # Build provenance for the tarball (top level, next to bin/).
+          printf 'version=%s\ncommit=%s\ndate=%s\nsource=release_fork\n' \
+            "$roll_version" "$GITHUB_SHA" "$ver_date" > stage/usr/BUILD-INFO.txt
+          tar -czf "$TARBALL" -C stage/usr .
+          ls -lh "$TARBALL"
+          # List via a file (not a pipe to head): with pipefail a closing
+          # head makes tar exit with SIGPIPE and fails the step.
+          tar -tzf "$TARBALL" > tar-contents.txt
+          head -n 30 tar-contents.txt
+          wc -l tar-contents.txt
+
+      - name: Smoke test staged payload
+        shell: bash --noprofile --norc -eo pipefail {0}
+        run: |
+          rm -rf /tmp/nvim-smoke
+          mkdir -p /tmp/nvim-smoke
+          tar -xzf "$TARBALL" -C /tmp/nvim-smoke
+          /tmp/nvim-smoke/bin/nvim --version | head -n 5
+          /tmp/nvim-smoke/bin/nvim --headless +'qa!'
+
+      - name: Install nix (verification only)
+        uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
+
+      - name: Publish tarball to versioned release
+        # One release per version (never overwritten): old versions stay
+        # downloadable for stale machines. Re-runs of the same commit reuse
+        # the same tag (idempotent create + clobber upload).
+        shell: bash --noprofile --norc -eo pipefail {0}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ver_tag="fork-${roll_version}"
+          echo "ver_tag=${ver_tag}" >> "$GITHUB_ENV"
+          git tag -f "$ver_tag"
+          git push -f origin "$ver_tag"
+          if ! gh release view "$ver_tag" >/dev/null 2>&1; then
+            gh release create "$ver_tag" \
+              --title "Neovim fork ${roll_version}" \
+              --notes "Prebuilt neovim ${roll_version} from release_fork (${GITHUB_SHA})." \
+              --target release_fork
+          fi
+          gh release upload "$ver_tag" "$TARBALL" --clobber
+
+      - name: Generate + publish verified .nix and verify nix build
+        shell: bash --noprofile --norc -eo pipefail {0}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          url="https://github.com/WantenMN/neovim/releases/download/${ver_tag}/${TARBALL}"
+          # Download back through the release URL: proves the asset is live
+          # and yields the exact hash nix consumers will see.
+          sri=$(nix store prefetch-file --json "$url" | jq -r .hash)
+          echo "sri: $sri"
+          if [ -z "$sri" ] || [ "$sri" = "null" ]; then
+            echo "error: failed to prefetch $url" >&2
+            exit 1
+          fi
+          sed -i -E \
+            -e "s|version = \".*\";|version = \"${roll_version}\";|" \
+            -e "s|url = \".*\";|url = \"${url}\";|" \
+            -e "s|hash = \"sha256-.*\";|hash = \"${sri}\";|" \
+            "dist/nix/${NIX_ASSET}"
+          grep -nE 'version = |url = |hash = ' "dist/nix/${NIX_ASSET}"
+          # Versioned asset (retained on its own release) + fixed-name pointer
+          # (rolling tag, dotfiles target).
+          cp "dist/nix/${NIX_ASSET}" "dist/nix/${NIX_VERSIONED}"
+          gh release upload "$ver_tag" "dist/nix/${NIX_VERSIONED}" --clobber
+          git tag -f "$ROLL_TAG"
+          git push -f origin "$ROLL_TAG"
+          if ! gh release view "$ROLL_TAG" >/dev/null 2>&1; then
+            gh release create "$ROLL_TAG" \
+              --title "Neovim fork rolling pointers" \
+              --notes "Fixed-name .nix pointers to the newest versioned releases. Each version has its own release; old versions are retained (newest 10)." \
+              --target release_fork
+          fi
+          gh release upload "$ROLL_TAG" "dist/nix/${NIX_ASSET}" --clobber
+          # Verify exactly what dotfiles will build: nixpkgs + fetchurl(tarball).
+          out=$(nix build -L --impure --no-link --print-out-paths --expr \
+            "let pkgs = import (builtins.fetchTarball { url = \"$NIXPKGS_TARBALL\"; }) {}; in pkgs.callPackage ./dist/nix/${NIX_ASSET} {}")
+          echo "built: $out"
+          "$out/bin/nvim" --version | head -n 5
+          "$out/bin/nvim" --headless +'qa!'
+          test -L "$out/share/applications/nvim.desktop" || test -f "$out/share/applications/nvim.desktop"
+
+      - name: Prune old versioned releases (keep newest)
+        # Old versions are separate releases so stale machines can reinstall
+        # the exact version their dotfiles pin; only releases beyond the
+        # newest $KEEP_VERSIONS are deleted (release + tag). The rolling
+        # pointer release is never touched.
+        shell: bash --noprofile --norc -eo pipefail {0}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tags=$(gh release list --limit 100 --json tagName,createdAt \
+            --jq -r 'sort_by(.createdAt) | reverse | .[].tagName' \
+            | grep -E '^fork-' | grep -v -x "$ROLL_TAG" || true)
+          count=$(echo "$tags" | grep -c . || true)
+          count=${count:-0}
+          if [ "$count" -gt "$KEEP_VERSIONS" ]; then
+            echo "$tags" | tail -n +"$((KEEP_VERSIONS + 1))" | while IFS= read -r t; do
+              [ -n "$t" ] || continue
+              echo "pruning old versioned release: $t"
+              gh release delete "$t" --cleanup-tag -y
+            done
+          else
+            echo "keeping all $count versioned release(s)"
+          fi
