@@ -67,23 +67,19 @@ jobs:
           echo "short_sha=${short_sha}" >> "$GITHUB_ENV"
           echo "ver_date=${ver_date}" >> "$GITHUB_ENV"
 
-      - name: Configure (Release, prefix /usr)
+      - name: Build (bundled deps via Makefile)
+        # NOTE: do NOT call cmake directly: third-party libs (luv, libuv,
+        # tree-sitter, ...) are built by the Makefile's deps stage first.
         shell: bash --noprofile --norc -eo pipefail {0}
         run: |
-          cmake -S . -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INSTALL_PREFIX=/usr
-
-      - name: Build
-        shell: bash --noprofile --norc -eo pipefail {0}
-        run: cmake --build build -j"$(nproc)"
+          make -j"$(nproc)" CMAKE_BUILD_TYPE=Release CMAKE_INSTALL_PREFIX=/usr
 
       - name: Install to stage and pack tarball
         shell: bash --noprofile --norc -eo pipefail {0}
         run: |
           rm -rf stage
           mkdir -p stage
-          DESTDIR="$PWD/stage" cmake --install build
+          DESTDIR="$PWD/stage" make install
           # Build provenance for the tarball (top level, next to bin/).
           printf 'version=%s\ncommit=%s\ndate=%s\nsource=release_fork\n' \
             "$roll_version" "$GITHUB_SHA" "$ver_date" > stage/usr/BUILD-INFO.txt
