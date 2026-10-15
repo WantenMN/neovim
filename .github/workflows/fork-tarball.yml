@@ -81,9 +81,14 @@ jobs:
       - name: Build (bundled deps via Makefile)
         # NOTE: do NOT call cmake directly: third-party libs (luv, libuv,
         # tree-sitter, ...) are built by the Makefile's deps stage first.
+        # Plain libdir (not Debian multiarch): nvim only auto-adds
+        # <prefix>/lib/nvim to rtp for parser/*.so; a multiarch
+        # lib/<triplet>/nvim layout leaves vim.treesitter.start() with
+        # E5113 (no parser) in ftplugins.
         shell: bash --noprofile --norc -eo pipefail {0}
         run: |
-          make -j"$(nproc)" CMAKE_BUILD_TYPE=Release CMAKE_INSTALL_PREFIX=/usr
+          make -j"$(nproc)" CMAKE_BUILD_TYPE=Release CMAKE_INSTALL_PREFIX=/usr \
+            'CMAKE_EXTRA_FLAGS=-DCMAKE_INSTALL_LIBDIR=lib'
 
       - name: Install to stage and pack tarball
         shell: bash --noprofile --norc -eo pipefail {0}
@@ -110,6 +115,13 @@ jobs:
           tar -xzf "$TARBALL" -C /tmp/nvim-smoke
           /tmp/nvim-smoke/bin/nvim --version | head -n 5
           /tmp/nvim-smoke/bin/nvim --headless +'qa!'
+          # Parser regression: the tarball must expose parser/*.so where nvim
+          # looks (lib/nvim, see build step). Opens a lua file and actually
+          # starts the treesitter highlighter (E5113 if not found).
+          printf 'print(1)\n' > /tmp/nvim-smoke-check.lua
+          /tmp/nvim-smoke/bin/nvim --clean --headless /tmp/nvim-smoke-check.lua \
+            +"lua assert(pcall(vim.treesitter.start), 'treesitter start failed')" \
+            +'qa!'
 
       - name: Install nix (verification only)
         uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
@@ -173,6 +185,10 @@ jobs:
           echo "built: $out"
           "$out/bin/nvim" --version | head -n 5
           "$out/bin/nvim" --headless +'qa!'
+          printf 'print(1)\n' > /tmp/nvim-verify-check.lua
+          "$out/bin/nvim" --clean --headless /tmp/nvim-verify-check.lua \
+            +"lua assert(pcall(vim.treesitter.start), 'treesitter start failed')" \
+            +'qa!'
           test -L "$out/share/applications/nvim.desktop" || test -f "$out/share/applications/nvim.desktop"
 
       - name: Prune old versioned releases (keep newest)
