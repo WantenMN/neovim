@@ -85,7 +85,11 @@ jobs:
             "$roll_version" "$GITHUB_SHA" "$ver_date" > stage/usr/BUILD-INFO.txt
           tar -czf "$TARBALL" -C stage/usr .
           ls -lh "$TARBALL"
-          tar -tzf "$TARBALL" | head -n 30
+          # List via a file (not a pipe to head): with pipefail a closing
+          # head makes tar exit with SIGPIPE and fails the step.
+          tar -tzf "$TARBALL" > tar-contents.txt
+          head -n 30 tar-contents.txt
+          wc -l tar-contents.txt
 
       - name: Smoke test staged payload
         shell: bash --noprofile --norc -eo pipefail {0}

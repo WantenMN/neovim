@@ -14,6 +14,9 @@ stdenv.mkDerivation rec {
     hash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
   };
 
+  # Tarball has multiple top-level entries (bin/ lib/ share/); unpack in place.
+  sourceRoot = ".";
+
   nativeBuildInputs = [
     autoPatchelfHook
   ];
